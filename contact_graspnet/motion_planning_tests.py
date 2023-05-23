@@ -20,6 +20,7 @@ from robosuite.utils.transform_utils import (
     quat_conjugate,
     quat_multiply,
 )
+from collections import defaultdict 
 np.set_printoptions(suppress=True)
 
 # imports for contact graspnet
@@ -41,7 +42,7 @@ import config_utils
 from data import regularize_pc_point_count, depth2pc, load_available_input_data
 
 from contact_grasp_estimator import GraspEstimator
-#from visualization_utils import visualize_grasps, show_image
+from visualization_utils import visualize_grasps, show_image
 from mp_env import set_robot_based_on_ee_pos, update_controller_config, apply_controller, mp_to_point
 
 def main(global_config, 
@@ -72,32 +73,40 @@ def main(global_config,
     np.random.seed(0)
     env = suite.make("Lift", "Panda", camera_names="frontview", camera_depths=True, camera_segmentations='element')
     o = env.reset()
+    cube_pos = o["cube_pos"]
+    # environment images
     color_img = np.flipud(o['frontview_image'].copy())
     depth_img = np.flipud(o['frontview_depth'])
-    #seg_map 
-    cam_intrinsic_mat = CU.get_camera_intrinsic_matrix(env.sim, "frontview", 256, 256)
+    #seg_map and depth map
     depth_map = CU.get_real_depth_map(env.sim, depth_img)
-    rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
-        o3d.geometry.Image(color_img.astype(np.uint8)), 
-        o3d.geometry.Image((depth_map*1000).astype(np.float32)))
-    # check depth map stuff
-    print(f"Max min of original depth: {np.max(depth_map), np.min(depth_map)}")
-    print(f"Max of new depth: {np.max(np.asarray(rgbd_image.depth)), np.min(np.asarray(rgbd_image.depth))}")
-    new_depth = np.asarray(rgbd_image.depth).astype(np.float32)
-    pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
-            rgbd_image,
-            o3d.camera.PinholeCameraIntrinsic(256, 256, cam_intrinsic_mat[0][0], #fx
-                                                        cam_intrinsic_mat[1][1], #fy
-                                                        cam_intrinsic_mat[0][2], #cx
-                                                        cam_intrinsic_mat[1][2], #cy
-                                                        ))
-    d = {
-        'rgb': color_img,
-        'depth': depth_map[:, :, 0],
-        'K': cam_intrinsic_mat,
-        'seg': np.flipud(o['frontview_segmentation_element'].astype(np.float32))[:, :, 0],
-        'xyz': np.asarray(pcd.points)
-    }
+    seg = np.flipud(o['frontview_segmentation_element'])
+    # get camera matrix
+    world_to_camera = CU.get_camera_transform_matrix(
+        sim=env.sim,
+        camera_name="frontview",
+        camera_height=256,
+        camera_width=256,
+    )
+    cam_K = CU.get_camera_intrinsic_matrix(env.sim, 'frontview', 256, 256)
+    camera_to_world = np.linalg.inv(world_to_camera)
+    # compute point cloud 
+    pc_full = []
+    pc_segments = defaultdict(list)
+    for i in range(256):
+        for j in range(256):
+            estimated_obj_pos = CU.transform_from_pixels_to_world(
+                pixels=np.array([i, j]),
+                depth_map=depth_map,
+                camera_to_world_transform=camera_to_world
+            )
+            pc_full.append(estimated_obj_pos.copy())
+            pc_segments[seg[i, j].item()].append(estimated_obj_pos.copy())   
+    # convert to array 
+    pc_full = np.asarray(pc_full)
+    for k in pc_segments.keys():
+        print(k, np.asarray(pc_segments[k]).shape)
+        pc_segments[k] = np.asarray(pc_segments[k])
+    # check pc_segments k and make sure that this works 
     # set up code for grasp estimator
     # Build the model
     grasp_estimator = GraspEstimator(global_config)
@@ -114,32 +123,57 @@ def main(global_config,
 
     # Load weights
     grasp_estimator.load_weights(sess, saver, checkpoint_dir, mode='test')
-    # load in data from what we previously computed
-    segmap, rgb, depth, cam_K, pc_full, pc_colors = d['seg'], d['rgb'], d['depth'], d['K'], d['xyz'], None 
-    pc_full, pc_segments, pc_colors = grasp_estimator.extract_point_clouds(depth, cam_K, segmap=segmap, rgb=rgb,
-                                                                                    skip_border_objects=skip_border_objects, z_range=z_range)
-    print(pc_segments.keys())
-    cube_pos = env.sim.data.get_body_xpos("cube_main")
-    #assert False
+    # try visualizing point cloud given just depth and color 
+    print(depth_map.shape)
+    print(seg.shape)
+    # this is the correct transformation to get the visualization correct
+    for i in range(len(pc_full)):
+        point = pc_full[i].copy()
+        point = np.array([-point[1], -point[2], -point[0]])
+        pc_full[i] = point
+    for k in pc_segments.keys():
+        for i in range(len(pc_segments[k])):
+            point = pc_segments[k][i].copy()
+            point = np.array([-point[1], -point[2], -point[0]])
+            pc_segments[k][i] = point
     pred_grasps_cam, scores, contact_pts, _ = grasp_estimator.predict_scene_grasps(sess, pc_full, pc_segments=pc_segments, 
                                                                                           local_regions=local_regions, filter_grasps=filter_grasps, forward_passes=forward_passes)
-    # geom id 84 is the cube visual geom, so we need to consider that 
-    cube_pred_grasps, cube_scores, cube_contacts = pred_grasps_cam[-1], scores[-1], contact_pts[-1]
-    # get camera extrinsic matrix
-    cam_extrinsic_mat = CU.get_camera_extrinsic_matrix(env.sim, "frontview")
-    # convert all_pred_grasps to environment world frame
-    for i in range(len(cube_pred_grasps)):
-        cube_pred_grasps[i] = cam_extrinsic_mat @ cube_pred_grasps[i] 
+    cube_pred_grasps, cube_scores, cube_contacts = pred_grasps_cam[84], scores[84], contact_pts[84]
+    # show_image(color_img, seg)
+    # visualize_grasps(pc_full, pred_grasps_cam, scores, plot_opencv_cam=True, pc_colors=None)
+    np.savez(f'results/predictions_{3}.npz', 
+                  pred_grasps_cam=pred_grasps_cam, scores=scores, contact_pts=contact_pts)
+    np.save('results/pcd_3.npy', pc_full)
+    # check distance of pred grasps vector after transforming 
+    extrinsic_mat = CU.get_camera_extrinsic_matrix(env.sim, "frontview")
+    # contact distances -> if we perform reverse transformation we are good
+    for i in range(len(cube_contacts)):
+        cube_con = cube_contacts[i].copy()
+        cube_con *= -1
+        cube_con = np.array([cube_con[2], cube_con[0], cube_con[1]])
+        print(np.linalg.norm(cube_con - cube_pos))
     # get target pos + quat from SE(3) grasps
-    target_poses = [(cube_pred_grasps[i][0:3, 3], cube_pred_grasps[i][0:3, 0:3]) for i in range(len(cube_pred_grasps))]
+    target_poses = [(cube_pred_grasps[i][:3, 3], cube_pred_grasps[i][:3, :3]) for i in range(len(cube_pred_grasps))]
     # get cube position
     cube_pos = env.sim.data.get_body_xpos("cube_main")
     # try planning to target poses
-    best_grasp = np.argmin([
-        np.linalg.norm(target_poses[i][0] - cube_pos)
-        for i in range(len(target_poses))
-    ])
+    best_grasp = np.argmax(cube_scores)
+    print(f"Best cube score {np.max(cube_scores)}")
     target_pos, target_quat = target_poses[best_grasp][0], target_poses[best_grasp][1]
+    print(f"Orig distance: {np.linalg.norm(target_pos - cube_pos)}")
+    target_pos = -1*np.array([target_pos[2], target_pos[0], target_pos[1]])
+    print(f"True distance: {np.linalg.norm(target_pos - cube_pos)}")
+    assert False
+    """
+    Next steps
+    1) find best grasp and visualize - see if it looks reasonable
+    2) calculate inverse transformation - do i need to do it for just rotation matrix or both? (seems like only rotation matrix)
+    3) check to see if visualized grasp matches that of 
+    """
+    # swap columns target_quat 
+    # tmp = target_quat[:, 2].copy()
+    # target_quat[:, 2] = target_quat[:, 0].copy()
+    # target_quat[:, 0] = tmp
     # set up environment and ik controller
     qpos_curr = env.sim.data.qpos.copy()
     qvel_curr = env.sim.data.qvel.copy()
@@ -184,7 +218,7 @@ def main(global_config,
             env,
             ik_controller_config,
             osc_controller_config,
-            np.concatenate((cube_pos + np.array([0.05, 0., 0]), env._eef_xquat)).astype(np.float64),#np.concatenate((target_pos, mat2quat(target_quat))).astype(np.float64),
+            np.concatenate((cube_contacts[best_grasp], og_eef_xquat)).astype(np.float64),
             qpos=qpos_curr,
             qvel=qvel_curr,
             grasp=False,
@@ -193,6 +227,7 @@ def main(global_config,
             # planning_time=env.planning_time,
             get_intermediate_frames=False,
         )
+    #o = env.step(np.array([0.,0,0,0,0,0,0,5.0]))
     print(f"Target pos: {target_pos}")
     print(f"Eef xpos: {env._eef_xpos}")
     print(f"Distance to cube: {np.linalg.norm(env._eef_xpos - cube_pos)}")
